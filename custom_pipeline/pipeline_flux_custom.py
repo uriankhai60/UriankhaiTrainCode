@@ -78,7 +78,7 @@ def retrieve_timesteps(
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
 
-class KhhFluxPipeline(
+class CustomFluxPipeline(
     DiffusionPipeline,
     FluxLoraLoaderMixin,
     FromSingleFileMixin,
@@ -152,5 +152,115 @@ class KhhFluxPipeline(
         text_input_ids = text_inputs.input_ids
         untruncated_ids = self.tokenizer_2(prompt, padding="longest", return_tensors="pt").input_ids
 
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer_2.batch_decode(untruncated_ids[:, self.tokenizer_max_length - 1: -1])
+            logger.warning("Fuck")
         
+        prompt_embeds = self.text_encoder_2(text_input_ids.to(device), output_hidden_states=False)[0]
+        dtype = self.text_encoder_2.dtype
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+        _, seq_len, _ = prompt_embeds.shape
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+        return prompt_embeds
+    
+    def _get_clip_prompt_embeds(
+        self,
+        prompt,
+        num_images_per_prompt=1,
+        device = None
+    ):
+        device = device or self._execution_device
+
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        batch_size = len(prompt)
+
+        if isinstance(self, TextualInversionLoaderMixin):
+            prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
+        
+        text_inputs = self.tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=self.tokenizer_max_length,
+            truncation=True,
+            return_overflowing_tokens=False,
+            return_length=False,
+            return_tensors="pt",
+        )
+
+        text_input_ids = text_inputs.input_ids
+        untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer.batch_decode(untruncated_ids[:,self.tokenizer_max_length-1:-1])
+            logger.warning("fuck")
+        prompt_embeds = self.text_encoder(text_input_ids.to(device), output_hidden_states=False)
+
+        ## use pooled output of CLIPTextModel
+        prompt_embeds = prompt_embeds.pooler_output
+        prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
+
+        ## duplicate text embeddings for each generation per prompt, using mps friendly method
+        prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt)
+        prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, -1)
+
+        return prompt_embeds
+
+    def encode_prompt(
+        self,
+        prompt: Union[str, List[str]],
+        prompt_2: Union[str, List[str]],
+        device: Optional[torch.device] = None,
+        num_images_per_prompt:int = 1,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        max_sequence_length:int = 512,
+        lora_scale: Optional[float] = None,
+    ):
+        device = device or self._execution_device
+
+        ## set lora scale so that monkey patched LoRA
+        ## function of text encoder can correctly access it
+        if lora_scale is not None and isinstance(self, FluxLoraLoaderMixin):
+            self._lora_scale = lora_scale
+            ## dynamically adjust the LoRA scale
+            if self.text_encoder is not None and USE_PEFT_BACKEND:
+                scale_lora_layers(self.text_encoder, lora_scale)
+            if self.text_encoder_2 is not None and USE_PEFT_BACKEND:
+                scale_lora_layers(self.text_encoder_2, lora_scale)
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+
+        if prompt_embeds is None:
+            prompt_2 = prompt_2 or prompt
+            prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
+
+            ## we only use the pooled prompt output from the CLIPTextModel
+            pooled_prompt_embeds = self._get_clip_prompt_embeds(
+                prompt=prompt,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+            )
+            prompt_embeds = self._get_t5_prompt_embeds(
+                prompt=prompt_2,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=device,
+            )
+        
+        if self.text_encoder is not None:
+            if isinstance(self, FluxLoraLoaderMixin) and USE_PEFT_BACKEND:
+                ## retrieve the original scale by scaling back the LoRA layers
+                unscale_lora_layers(self.text_encoder, lora_scale)
+        
+        if self.text_encoder_2 is not None:
+            if isinstance(self, FluxLoraLoaderMixin) and USE_PEFT_BACKEND:
+                ## retrieve the original sclae by scaling back the LoRA layers
+                unscale_lora_layers(self.text_encoder_2, lora_scale)
+        
+        dtype = self.text_encoder.dtype if self.text_encoder is not None else self.transformer.dtype
+        text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
+        return prompt_embeds, pooled_prompt_embeds, text_ids
+
+    def encode_image(self, image, device, num_images_per_prompt):
         return None
