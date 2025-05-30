@@ -263,4 +263,345 @@ class CustomFluxPipeline(
         return prompt_embeds, pooled_prompt_embeds, text_ids
 
     def encode_image(self, image, device, num_images_per_prompt):
+        dtype = next(self.image_encoder.parameters()).dtype
+
+        if not isinstance(self, image, device, num_images_per_prompt):
+            image = self.feature_extractor(image, return_tensor="pt").pixel_values
+        
+        image = image.to(device=device, dtype=dtype)
+        image_embeds = self.image_encoder(image).image_embeds
+        image_embeds = image_embeds.repeat_interleave(num_images_per_prompt, dim=0)
+        return image_embeds
+
+    def prepare_ip_adapter_image_embeds(
+        self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_promtp
+    ):
+        image_embeds = []
+        if ip_adapter_image_embeds is None:
+            if not isinstance(ip_adapter_image, list):
+                ip_adapter_image = [ip_adapter_image]
+            if len(ip_adapter_image) != self.transformer.encoder_hid_proj.num_ip_adapters:
+                raise ValueError("Fuck")
+            for single_ip_adapter_image in ip_adapter_image:
+                single_image_embeds = self.encode_image(single_ip_adapter_image, device, 1)
+                image_embeds.append(single_image_embeds[None, :])
+        else:
+            if not isinstance(ip_adapter_image_embeds, list):
+                ip_adapter_image_embeds = [ip_adapter_image_embeds]
+            if len(ip_adapter_image_embeds) != self.transformer.encoder_hid_proj.num_ip_adapters:
+                raise ValueError("Fuck")
+            for single_image_embeds in ip_adapter_image_embeds:
+                image_embeds.append(single_image_embeds)
+        
+        ip_adapter_image_embeds = []
+        for single_image_embeds in image_embeds:
+            single_image_embeds = torch.cat([single_image_embeds] * num_images_per_promtp, dim=0)
+            single_image_embeds = single_image_embeds.to(device=device)
+            ip_adapter_image_embeds.append(single_image_embeds)
+        return ip_adapter_image_embeds
+    
+    def check_inputs(
+        self,
+        prompt,
+        prompt_2,
+        height,
+        width,
+        negative_prompt=None,
+        negative_prompt_2=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
+        pooled_prompt_embeds=None,
+        negative_pooled_prompt_embeds=None,
+        callback_on_step_end_tensor_inputs=None,
+        max_sequence_length=None,
+    ):
         return None
+    
+    @staticmethod
+    def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
+        latent_image_ids = torch.zeros(height, width, 3)
+        latent_image_ids[..., 1] = latent_image_ids[..., 1] + torch.arange(height)[:, None]
+        latent_image_ids[..., 2] = latent_image_ids[..., 2] + torch.arange(width)[None, :]
+
+        latent_image_id_height, latent_image_id_width, latent_image_id_channels = latent_image_ids.shape
+        latent_image_ids = latent_image_ids.reshape(latent_image_id_height * latent_image_id_width, latent_image_id_channels)
+        return latent_image_ids.to(device=device, dtype=dtype)
+    
+    @staticmethod
+    def _pack_latents(latents, batch_size, num_channels_latents, height, width): # (1,2,4,4)
+        latents = latents.view(batch_size, num_channels_latents, height//2, 2, width//2, 2) # (1,2,2,2,2,2)
+        latents = latents.permute(0, 2, 4, 1, 3, 5) # b, h, w, c, h', w'
+        latents = latents.reshape(batch_size, (height//2)*(width//2), num_channels_latents*4) # (1,4,8)
+        return latents
+    
+    @staticmethod
+    def _unpack_latents(latents, height, width, vae_scale_factor):
+        batch_size, num_patches, channels = latents.shape
+        height = 2 * (int(height) // (vae_scale_factor * 2))
+        width = 2 * (int(width) // (vae_scale_factor * 2))
+        latents = latents.view(batch_size, height//2, width//2, channels//4, 2, 2)
+        latents = latents.permute(0, 3, 1, 4, 2, 5)
+        latents = latents.reshape(batch_size, channels//(2*2), height, width)
+        return latents
+    
+    def enable_vae_slicing(self):
+        self.vae.enable_slicing()
+    
+    def disable_vae_slicing(self):
+        self.vae.disable_slicing()
+    
+    def enable_vae_tiling(self):
+        self.vae.enable_tiling()
+    
+    def disable_vae_tiling(self):
+        self.vae.disable_tiling()
+    
+    def prepare_latents(
+        self,
+        batch_size,
+        num_channels_latents,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        latents=None,
+    ):
+        height = 2 * (int(height) // (self.vae_scale_factor*2))
+        width = 2 * (int(width) // (self.vae_scale_factor*2))
+        shape = (batch_size, num_channels_latents, height, width)
+
+        if latents is not None:
+            latent_image_ids = self._prepare_latent_image_ids(batch_size, height//2, width//2, device, dtype)
+            return latents.to(device=device, dtype=dtype), latent_image_ids
+        
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError("Fuck")
+        
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype) # generate random tensor
+        latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
+        latent_image_ids = self._prepare_latent_image_ids(batch_size, height//2, width//2, device, dtype)
+    
+        return latents, latent_image_ids
+
+    @property
+    def guidance_scale(self):
+        return self._guidance_scale
+
+    @property
+    def joint_attention_kwargs(self):
+        return self._joint_attention_kwargs
+    
+    @property
+    def num_timesteps(self):
+        return self._num_timesteps
+    
+    @property
+    def current_timestep(self):
+        return self._current_timestep
+    
+    @property
+    def interrupt(self):
+        return self._interrupt
+    
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt: Union[str, List[str]] = None,
+        prompt_2: Optional[Union[str, List[str]]] = None,
+        negative_prompt: Union[str, List[str]] = None,
+        negative_prompt_2: Optional[Union[str, List[str]]] = None,
+        true_cfg_scale: float = 1.0,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps:int = 28,
+        sigmas: Optional[List[float]] = None,
+        guidance_scale:float = 3.5,
+        num_images_per_prompt: Optional[int] = 1,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        ip_adapter_image: Optional[PipelineImageInput] = None,
+        ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
+        negative_ip_adapter_image: Optional[PipelineImageInput] = None,
+        negative_ip_adapter_image_embeds: Optional[List[torch.Tensor]] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        max_sequence_length: int = 512,
+    ):
+        height = height or self.default_sample_size * self.vae_scale_factor
+        width = width or self.default_sample_size * self.vae_scale_factor
+
+        ## check inputs.
+        self.check_inputs(
+            prompt,
+            prompt_2,
+            height,
+            width,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            callback_on_step_end_tensor_inputs=callback_on_step_end_tensor_inputs,
+            max_sequence_length=max_sequence_length
+        )
+        self._guidance_scale = guidance_scale
+        self._joint_attention_kwargs = joint_attention_kwargs
+        self._current_timestep = None
+        self._interrupt = False
+
+        ## define call params
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+        
+        device = self._execution_device
+        lora_scale = (
+            self.joint_attention_kwargs.get("scale", None) \
+                if self.joint_attention_kwargs is not None else None
+            )
+        has_neg_prompt = negative_prompt is not None or \
+        (negative_prompt_embeds is not None and negative_pooled_prompt_embeds is not None)
+
+        do_true_cfg = true_cfg_scale >1 and has_neg_prompt
+        (prompt_embeds, pooled_prompt_embeds, text_ids) = self.encode_prompt(
+            prompt=prompt,
+            prompt_2=prompt_2,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+            lora_scale=lora_scale,
+        )
+        if do_true_cfg:
+            (negative_prompt_embeds, negative_pooled_prompt_embeds, negative_text_ids,) = self.encode_prompt(
+                prompt=negative_prompt,
+                prompt_2=negative_prompt_2,
+                prompt_embeds=negative_prompt_embeds,
+                pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                lora_scale=lora_scale,
+            )
+        
+        ## prepare latent variables
+        num_channels_latents = self.transformer.config.in_channels // 4
+        latents, latent_image_ids = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+
+        ## prepare timesteps
+        sigmas = np.linspace(1.0, 1/num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        image_seq_len = latents.shape[1]
+        mu = calculate_shift(
+            image_seq_len,
+            self.scheduler.config.get("base_image_seq_len", 256),
+            self.scheduler.config.get("max_image_seq_len", 4096),
+            self.scheduler.config.get("base_shift", 0.5),
+            self.scheduler.config.get("max_shift", 1.15),
+        )
+        
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            sigmas = sigmas,
+            mu=mu,
+        )
+        num_warmup_steps = max(len(timesteps) - num_inference_steps*self.scheduler.order, 0)
+        self._num_timesteps = len(timesteps)
+
+        ## handle guidance
+        if self.transformer.config.guidance_embeds:
+            guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
+            guidance = guidance.expand(latents.shape[0])
+        else:
+            guidance = None
+
+        ## ip_adapter_image:O, negative_ip_adapter_image: X
+        if (ip_adapter_image is not None or ip_adapter_image_embeds is not None) and\
+        (negative_ip_adapter_image is None and negative_ip_adapter_image_embeds is None):
+            negative_ip_adapter_image = np.zeros((width, height, 3), dtype=np.uint8)
+            negative_ip_adapter_image = [negative_ip_adapter_image] * self.transformer.encoder_hid_proj.num_ip_adapters
+        ## ip_adapter_image:X, negative_ip_adapter_image: O
+        elif (ip_adapter_image is None or ip_adapter_image_embeds is None) and\
+        (negative_ip_adapter_image is not None and negative_ip_adapter_image_embeds is not None):
+            ip_adapter_image = np.zeros((width, height, 3), dtype=np.uint8)
+            ip_adapter_image = [ip_adapter_image] * self.transformer.encoder_hid_proj.num_ip_adapters
+        
+        if self.joint_attention_kwargs is None:
+            self._joint_attention_kwargs = {}
+        
+        image_embeds = None
+        negative_image_embeds = None
+        
+        ## ip_adapter image embed
+        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
+            image_embeds = self.prepare_ip_adapter_image_embeds(
+                ip_adapter_image,
+                ip_adapter_image_embeds,
+                device,
+                batch_size * num_images_per_prompt,
+            )
+        
+        ## neg_ip_adapter_image embed
+        if negative_ip_adapter_image is not None or negative_ip_adapter_image_embeds is not None:
+            negative_image_embeds = self.prepare_ip_adapter_image_embeds(
+                negative_ip_adapter_image,
+                negative_ip_adapter_image_embeds,
+                device,
+                batch_size * num_images_per_prompt,
+            )
+        
+        ## denoising loop
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                if self.interrupt:
+                    continue
+
+                self._current_timestep = t
+                if image_embeds is not None:
+                    self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
+                timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                noise_pred = self.transformer(
+                    hidden_states = latents,
+                    timestep=timestep/1000,
+                    guidance=guidance,
+                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=prompt_embeds,
+                    txt_ids=text_ids,
+                    img_ids=latent_image_ids,
+                    joint_attention_kwargs=self.joint_attention_kwargs,
+                    return_dict=False,
+                )[0]
+
+                if do_true_cfg:
+                    ...
+                    noise_pred = ... # re-caculate
+                
+
+
+
+
+        return None
+
