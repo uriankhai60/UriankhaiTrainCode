@@ -596,12 +596,57 @@ class CustomFluxPipeline(
                 )[0]
 
                 if do_true_cfg:
-                    ...
-                    noise_pred = ... # re-caculate
+                    if negative_image_embeds is not None:
+                        self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
+                    neg_noise_pred = self.transformer(
+                        hidden_states=latents,
+                        timestep=timestep/1000,
+                        guidance=guidance,
+                        pooled_projections=negative_pooled_prompt_embeds,
+                        encoder_hidden_states=negative_prompt_embeds,
+                        txt_ids=negative_text_ids,
+                        img_ids=latent_image_ids,
+                        joint_attention_kwargs=self.joint_attention_kwargs,
+                        return_dict=False,
+                    )[0]
+                    noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred) # re-caculate
                 
+                ## compute the previous noisy sample x_t -> x_t-1
+                latents_dtype = latents.dtype
+                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
+                if latents.dtype != latents_dtype:
+                    if torch.backends.mps.is_available():
+                        latents = latents.to(latents_dtype)
+                
+                if callback_on_step_end is not None:
+                    callback_kwargs = {}
+                    for k in callback_on_step_end_tensor_inputs:
+                        callback_kwargs[k] = locals()[k]
+                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    
+                    latents = callback_outputs.pop("latents", latents)
+                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                
+                ## call the callback, if provided
+                if i == len(timesteps)-1 or ((i+1) > num_warmup_steps and (i+1)%self.scheduler.order == 0):
+                    progress_bar.update()
+                
+        self._current_timestep = None
 
+        if output_type == "latent":
+            image = latents
+        else:
+            latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            image = self.vae.decode(latents, return_dict=False)
+            image = self.image_processor.postprocess(image, output_type=output_type)
+        
+        ## offload all models
+        self.maybe_free_model_hooks()
 
+        if not return_dict:
+            return (image,)
 
-        return None
+        return FluxPipelineOutput(images=image)
 
