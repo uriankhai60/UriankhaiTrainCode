@@ -1,0 +1,89 @@
+# FLUX Control Training Configuration
+
+# Model Configuration
+model:
+  pretrained_model_name_or_path: "black-forest-labs/FLUX.1-dev"
+  variant: null
+  revision: null
+  cache_dir: null
+
+# Training Configuration
+training:
+  output_dir: "flux-control"
+  seed: 42
+  resolution: 1024
+  train_batch_size: 4
+  num_train_epochs: 1
+  max_train_steps: null
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false
+  learning_rate: 5.0e-6
+  scale_lr: false
+  lr_scheduler: "constant"
+  lr_warmup_steps: 500
+  lr_num_cycles: 1
+  lr_power: 1.0
+  max_grad_norm: 1.0
+
+# Optimizer Configuration
+optimizer:
+  use_8bit_adam: false
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.01
+  adam_epsilon: 1.0e-8
+
+# Data Configuration
+data:
+  dataset_name: null # dataset_name 또는 jsonl_for_train 중 하나는 반드시 설정해야 합니다.
+  dataset_config_name: null
+  jsonl_for_train: null
+  image_column: "image"
+  conditioning_image_column: "conditioning_image"
+  caption_column: "text"
+  max_train_samples: null
+  proportion_empty_prompts: 0
+  dataloader_num_workers: 0
+  log_dataset_samples: false
+
+# Validation Configuration
+validation:
+  validation_prompt: 
+    - "A beautiful landscape with mountains"
+    - "A portrait of a person"
+  validation_image:
+    - "path/to/validation_image1.jpg"
+    - "path/to/validation_image2.jpg"
+  num_validation_images: 1
+  validation_steps: 100
+  guidance_scale: 30.0
+
+# Checkpoint Configuration
+checkpoint:
+  checkpointing_steps: 500
+  checkpoints_total_limit: null
+  resume_from_checkpoint: null
+
+# Logging Configuration
+logging:
+  logging_dir: "logs"
+  allow_tf32: true
+  report_to: "tensorboard"
+  mixed_precision: "bf16"
+  tracker_project_name: "flux_train_control"
+
+# Hub Configuration
+hub:
+  push_to_hub: false
+  hub_token: null
+  hub_model_id: null
+
+# Advanced Configuration
+advanced:
+  only_target_transformer_blocks: false
+  upcast_before_saving: false
+  weighting_scheme: "none"
+  logit_mean: 0.0
+  logit_std: 1.0
+  mode_scale: 1.29
+  offload: false
